@@ -124,7 +124,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
-
+  p->priority = 3;
+  p->waited_ticks = 0;
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -288,7 +289,7 @@ kfork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
-
+  np->priority = p->priority;
   release(&np->lock);
 
   acquire(&wait_lock);
@@ -411,6 +412,23 @@ kwait(uint64 addr)
   }
 }
 
+int sched_mode = 3;  // 0=non-preemptive, 1=preemptive, 2=round-robin, 3=aging
+
+struct proc*
+highestPriorityRunnable(void)
+{
+  struct proc *p, *best = 0;
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state == RUNNABLE){
+      if(best == 0 || p->priority < best->priority)
+        best = p;
+    }
+    release(&p->lock);
+  }
+  return best;
+}
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -423,37 +441,70 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-
   c->proc = 0;
   for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
     intr_on();
     intr_off();
 
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+    // Aging: boost priority of processes waiting too long
+    if(sched_mode == 3){
+      for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+        if(p->state == RUNNABLE){
+          p->waited_ticks++;
+          if(p->waited_ticks >= 50 && p->priority > 1){
+            p->priority--;
+            p->waited_ticks = 0;
+          }
+        }
+        release(&p->lock);
       }
-      release(&p->lock);
     }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+
+    // Find best process to run based on priority
+    struct proc *chosen = 0;
+    int best_prio = 6;
+
+    if(sched_mode == 2){
+      // Round-robin: find best priority level, pick first in that level
+      for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+        if(p->state == RUNNABLE && p->priority < best_prio)
+          best_prio = p->priority;
+        release(&p->lock);
+      }
+      for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+        if(p->state == RUNNABLE && p->priority == best_prio){
+          chosen = p;
+          release(&p->lock);
+          break;
+        }
+        release(&p->lock);
+      }
+    } else {
+      // Modes 0, 1, 3: pick highest priority (lowest number)
+      for(p = proc; p < &proc[NPROC]; p++){
+        acquire(&p->lock);
+        if(p->state == RUNNABLE && p->priority < best_prio){
+          best_prio = p->priority;
+          chosen = p;
+        }
+        release(&p->lock);
+      }
+    }
+
+    if(chosen){
+      acquire(&chosen->lock);
+      if(chosen->state == RUNNABLE){
+        chosen->state = RUNNING;
+        chosen->waited_ticks = 0;
+        c->proc = chosen;
+        swtch(&c->context, &chosen->context);
+        c->proc = 0;
+      }
+      release(&chosen->lock);
+    } else {
       asm volatile("wfi");
     }
   }

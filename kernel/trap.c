@@ -5,6 +5,8 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+extern int sched_mode;
+extern struct proc* highestPriorityRunnable(void);
 
 struct spinlock tickslock;
 uint ticks;
@@ -81,8 +83,15 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  if(which_dev == 2 && myproc() != 0){
+    if(sched_mode == 1){
+      struct proc *hp = highestPriorityRunnable();
+      if(hp != 0 && hp->priority < myproc()->priority)
+        yield();
+    } else {
+      yield();
+    }
+  }
 
   prepare_return();
 
@@ -152,8 +161,15 @@ kerneltrap()
   }
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2 && myproc() != 0)
-    yield();
+  if(which_dev == 2 && myproc() != 0){
+    if(sched_mode == 1){
+      struct proc *hp = highestPriorityRunnable();
+      if(hp != 0 && hp->priority < myproc()->priority)
+        yield();
+    } else {
+      yield();
+    }
+  }
 
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.
